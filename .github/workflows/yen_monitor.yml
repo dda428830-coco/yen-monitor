@@ -1,0 +1,33 @@
+name: 日元套息风险日报
+
+on:
+  schedule:
+    # 每天新加坡时间 08:30（UTC 00:30）运行
+    - cron: '30 0 * * 1-5'
+    # 每天新加坡时间 21:00（UTC 13:00）运行（美股开盘后）
+    - cron: '0 13 * * 1-5'
+  workflow_dispatch:  # 支持手动触发
+
+jobs:
+  run-monitor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run monitor
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: |
+          python monitor.py
