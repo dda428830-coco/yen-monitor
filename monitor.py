@@ -10,6 +10,8 @@
 
 import os
 import json
+import csv
+import io
 import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -70,81 +72,177 @@ def fetch_price_data():
     return result
 
 
-def fetch_move_index():
-    """
-    MOVE指数：通过FRED获取ICE BofA MOVE Index
-    Series ID: ICEMOVE
-    """
+def _fred_observations(series_id, limit=5):
     if not FRED_API_KEY:
-        return {"note": "未配置FRED_API_KEY，跳过MOVE指数", "value": None}
-    
+        return None, "未配置FRED_API_KEY"
+
+    url = "https://api.stlouisfed.org/fred/series/observations"
+    params = {
+        "series_id": series_id,
+        "api_key": FRED_API_KEY,
+        "file_type": "json",
+        "sort_order": "desc",
+        "limit": limit,
+    }
+
     try:
-        url = "https://api.stlouisfed.org/fred/series/observations"
-        params = {
-            "series_id": "ICEMOVE",
-            "api_key": FRED_API_KEY,
-            "file_type": "json",
-            "sort_order": "desc",
-            "limit": 5,
-        }
-  resp.raise_for_status()
+        resp = requests.get(url, params=params, timeout=15)
+        if resp.status_code != 200:
+            return None, f"FRED {resp.status_code}: {resp.text[:500]}"
+
+
         data = resp.json()
-        obs = [item for item in data.get("observations", []) if item.get("value") not in (None, ".")]
-        if obs:
-            latest = obs[0]
-            prev   = obs[1] if len(obs) > 1 else obs[0]
-            val     = float(latest["value"])
-            val_prev = float(prev["value"])
-            return {
-                "value": round(val, 2),
-                "prev":  round(val_prev, 2),
-                "change": round(val - val_prev, 2),
-                "date":  latest["date"],
-            }
+        if "error_message" in data:
+            return None, f"FRED: {data['error_message']}"
+
+        obs = [
+            item for item in data.get("observations", [])
+            if item.get("value") not in (None, ".")
+        ]
+        return obs, None
     except Exception as e:
-        return {"error": str(e), "value": None}
-    
-    return {"value": None}
+        return None, f"FRED请求异常: {e}"
+
+
+def _latest_pair_from_yfinance(ticker, period="10d"):
+    data = yf.Ticker(ticker)
+    hist = data.history(period=period, interval="1d")
+    if len(hist) < 1:
+        raise ValueError(f"{ticker} 无可用行情")
+
+    closes = hist["Close"].dropna()
+    if len(closes) < 1:
+        raise ValueError(f"{ticker} 收盘价为空")
+
+    latest = closes.iloc[-1]
+    prev = closes.iloc[-2] if len(closes) >= 2 else latest
+    latest_date = closes.index[-1].strftime("%Y-%m-%d")
+    return float(latest), float(prev), latest_date
+
+
+def fetch_move_index():
+    """优先通过Yahoo Finance获取MOVE指数，失败时再尝试FRED并保留真实错误。"""
+    errors = []
+
+    try:
+        val, val_prev, date = _latest_pair_from_yfinance("^MOVE")
+        return {
+            "value": round(val, 2),
+            "prev": round(val_prev, 2),
+            "change": round(val - val_prev, 2),
+            "date": date,
+            "source": "Yahoo Finance ^MOVE",
+        }
+    except Exception as e:
+        errors.append(f"Yahoo ^MOVE: {e}")
+
+    obs, err = _fred_observations("ICEMOVE")
+    if obs:
+        latest = obs[0]
+        prev = obs[1] if len(obs) > 1 else obs[0]
+        val = float(latest["value"])
+        val_prev = float(prev["value"])
+        return {
+            "value": round(val, 2),
+            "prev": round(val_prev, 2),
+            "change": round(val - val_prev, 2),
+            "date": latest["date"],
+            "source": "FRED ICEMOVE",
+        }
+    if err:
+        errors.append(err)
+
+    return {
+        "error": "；".join(errors),
+        "value": None,
+    }
+
+
+def _cftc_int(row, *names):
+    for name in names:
+        raw = row.get(name)
+        if raw not in (None, ""):
+            return int(float(str(raw).replace(",", "").strip()))
+    raise KeyError(f"缺少字段: {', '.join(names)}")
+
+
+def _fetch_cftc_current_legacy_jpy():
+    url = "https://www.cftc.gov/dea/newcot/deafut.txt"
+    resp = requests.get(url, timeout=20)
+    if resp.status_code != 200:
+        raise RuntimeError(f"CFTC {resp.status_code}: {resp.text[:300]}")
+
+    text = resp.text.lstrip("\ufeff")
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise RuntimeError("CFTC返回内容没有表头")
+
+    for row in reader:
+        market = (
+            row.get("Market_and_Exchange_Names")
+            or row.get("Market and Exchange Names")
+            or row.get("Market_and_Exchange_Name")
+            or ""
+        ).upper()
+        if "JAPANESE YEN" not in market:
+            continue
+
+        long_pos = _cftc_int(row, "NonComm_Positions_Long_All", "Noncommercial Positions-Long (All)")
+        short_pos = _cftc_int(row, "NonComm_Positions_Short_All", "Noncommercial Positions-Short (All)")
+        long_change = _cftc_int(row, "Change_in_NonComm_Long_All", "Change in Noncommercial-Long (All)")
+        short_change = _cftc_int(row, "Change_in_NonComm_Short_All", "Change in Noncommercial-Short (All)")
+        net_position = long_pos - short_pos
+        weekly_change = long_change - short_change
+        date = (
+            row.get("As_of_Date_In_Form_YYMMDD")
+            or row.get("Report_Date_as_YYYY-MM-DD")
+            or row.get("As of Date in Form YYMMDD")
+            or "N/A"
+        )
+
+        return {
+            "net_position": net_position,
+            "prev_position": net_position - weekly_change,
+            "change": weekly_change,
+            "date": date,
+            "is_net_short": net_position < 0,
+            "source": "CFTC Legacy Futures Only",
+        }
+
+    raise RuntimeError("CFTC当前报告中未找到Japanese Yen行")
 
 
 def fetch_cftc_jpy():
-    """
-    CFTC日元非商业净持仓
-    通过FRED获取: JPYNTPOSNI（日元净持仓，合约数）
-    每周四收盘，周五晚美东时间发布
-    """
-    if not FRED_API_KEY:
-        return {"note": "未配置FRED_API_KEY，跳过CFTC数据", "value": None}
-    
-    try:
-        url = "https://api.stlouisfed.org/fred/series/observations"
-        params = {
-            "series_id": "JPYNTPOSNI",
-            "api_key": FRED_API_KEY,
-            "file_type": "json",
-            "sort_order": "desc",
-            "limit": 5,
-        }
-       resp.raise_for_status()
-        data = resp.json()
-        obs = [item for item in data.get("observations", []) if item.get("value") not in (None, ".")]
-        if obs:
-            latest   = obs[0]
-            prev     = obs[1] if len(obs) > 1 else obs[0]
-            val      = float(latest["value"])
-            val_prev = float(prev["value"])
-            return {
-                "net_position": int(val),
-                "prev_position": int(val_prev),
-                "change": int(val - val_prev),
-                "date": latest["date"],
-                "is_net_short": val < 0,
-            }
-    except Exception as e:
-        return {"error": str(e), "value": None}
-    
-    return {"value": None}
+    """优先直接读取CFTC当前报告；失败时再尝试旧FRED series并保留真实错误。"""
+    errors = []
 
+
+    try:
+        return _fetch_cftc_current_legacy_jpy()
+    except Exception as e:
+        errors.append(f"CFTC: {e}")
+
+    obs, err = _fred_observations("JPYNTPOSNI")
+    if obs:
+        latest = obs[0]
+        prev = obs[1] if len(obs) > 1 else obs[0]
+        val = float(latest["value"])
+        val_prev = float(prev["value"])
+        return {
+            "net_position": int(val),
+            "prev_position": int(val_prev),
+            "change": int(val - val_prev),
+            "date": latest["date"],
+            "is_net_short": val < 0,
+            "source": "FRED JPYNTPOSNI",
+        }
+    if err:
+        errors.append(err)
+
+    return {
+        "error": "；".join(errors),
+        "value": None,
+    }
 
 def compute_usdjpy_hist_vol(days=20):
     """计算USD/JPY近20日历史波动率作为隐波的近似"""
