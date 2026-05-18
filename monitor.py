@@ -87,8 +87,7 @@ def fetch_move_index():
             "sort_order": "desc",
             "limit": 5,
         }
-        resp = requests.get(url, params=params, timeout=10)
-        resp.raise_for_status()
+  resp.raise_for_status()
         data = resp.json()
         obs = [item for item in data.get("observations", []) if item.get("value") not in (None, ".")]
         if obs:
@@ -126,8 +125,7 @@ def fetch_cftc_jpy():
             "sort_order": "desc",
             "limit": 5,
         }
-        resp = requests.get(url, params=params, timeout=10)
-        resp.raise_for_status()
+       resp.raise_for_status()
         data = resp.json()
         obs = [item for item in data.get("observations", []) if item.get("value") not in (None, ".")]
         if obs:
