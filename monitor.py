@@ -12,6 +12,7 @@ import os
 import json
 import csv
 import io
+import re
 import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -166,51 +167,76 @@ def _cftc_int(row, *names):
     raise KeyError(f"缺少字段: {', '.join(names)}")
 
 
+def _parse_cftc_legacy_jpy_text(text):
+    match = re.search(
+        r"JAPANESE YEN\s*-\s*CHICAGO MERCANTILE EXCHANGE(?P<section>.*?)(?:\n\s*[A-Z][A-Z /()-]+\s*-\s*[A-Z]|\Z)",
+        text,
+        re.S,
+    )
+    if not match:
+        raise RuntimeError("CFTC当前报告中未找到Japanese Yen行")
+
+    section = match.group("section")
+    report_date = "N/A"
+    date_match = re.search(r"POSITIONS AS OF\s+(\d{2}/\d{2}/\d{2})", text)
+    if date_match:
+        report_date = date_match.group(1)
+
+    lines = section.splitlines()
+    commitments = None
+    changes = None
+    for idx, line in enumerate(lines):
+        if "Commitments" in line:
+            for candidate in lines[idx + 1:idx + 6]:
+                nums = re.findall(r"-?\d[\d,]*", candidate)
+                if len(nums) >= 8:
+                    commitments = [int(n.replace(",", "")) for n in nums]
+                    break
+        if "Changes from" in line:
+            for candidate in lines[idx + 1:idx + 6]:
+                nums = re.findall(r"-?\d[\d,]*", candidate)
+                if len(nums) >= 8:
+                    changes = [int(n.replace(",", "")) for n in nums]
+                    break
+
+    if not commitments:
+        raise RuntimeError("CFTC Japanese Yen区块中未找到Commitments数字")
+
+    long_pos = commitments[0]
+    short_pos = commitments[1]
+    long_change = changes[0] if changes else 0
+    short_change = changes[1] if changes else 0
+    net_position = long_pos - short_pos
+    weekly_change = long_change - short_change
+
+    return {
+        "net_position": net_position,
+        "prev_position": net_position - weekly_change,
+        "change": weekly_change,
+        "date": report_date,
+        "is_net_short": net_position < 0,
+        "source": "CFTC CME Legacy Futures Only",
+    }
+
+
 def _fetch_cftc_current_legacy_jpy():
-    url = "https://www.cftc.gov/dea/newcot/deafut.txt"
-    resp = requests.get(url, timeout=20)
-    if resp.status_code != 200:
-        raise RuntimeError(f"CFTC {resp.status_code}: {resp.text[:300]}")
+    urls = [
+        "https://www.cftc.gov/dea/futures/deacmesf.htm",
+        "https://www.cftc.gov/dea/newcot/deafut.txt",
+    ]
+    errors = []
 
-    text = resp.text.lstrip("\ufeff")
-    reader = csv.DictReader(io.StringIO(text))
-    if not reader.fieldnames:
-        raise RuntimeError("CFTC返回内容没有表头")
+    for url in urls:
+        try:
+            resp = requests.get(url, timeout=20)
+            if resp.status_code != 200:
+                errors.append(f"{url}: HTTP {resp.status_code}")
+                continue
+            return _parse_cftc_legacy_jpy_text(resp.text)
+        except Exception as e:
+            errors.append(f"{url}: {e}")
 
-    for row in reader:
-        market = (
-            row.get("Market_and_Exchange_Names")
-            or row.get("Market and Exchange Names")
-            or row.get("Market_and_Exchange_Name")
-            or ""
-        ).upper()
-        if "JAPANESE YEN" not in market:
-            continue
-
-        long_pos = _cftc_int(row, "NonComm_Positions_Long_All", "Noncommercial Positions-Long (All)")
-        short_pos = _cftc_int(row, "NonComm_Positions_Short_All", "Noncommercial Positions-Short (All)")
-        long_change = _cftc_int(row, "Change_in_NonComm_Long_All", "Change in Noncommercial-Long (All)")
-        short_change = _cftc_int(row, "Change_in_NonComm_Short_All", "Change in Noncommercial-Short (All)")
-        net_position = long_pos - short_pos
-        weekly_change = long_change - short_change
-        date = (
-            row.get("As_of_Date_In_Form_YYMMDD")
-            or row.get("Report_Date_as_YYYY-MM-DD")
-            or row.get("As of Date in Form YYMMDD")
-            or "N/A"
-        )
-
-        return {
-            "net_position": net_position,
-            "prev_position": net_position - weekly_change,
-            "change": weekly_change,
-            "date": date,
-            "is_net_short": net_position < 0,
-            "source": "CFTC Legacy Futures Only",
-        }
-
-    raise RuntimeError("CFTC当前报告中未找到Japanese Yen行")
-
+    raise RuntimeError("；".join(errors))
 
 def fetch_cftc_jpy():
     """优先直接读取CFTC当前报告；失败时再尝试旧FRED series并保留真实错误。"""
