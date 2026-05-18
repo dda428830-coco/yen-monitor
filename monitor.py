@@ -12,6 +12,7 @@ import os
 import json
 import csv
 import io
+import html
 import re
 import requests
 from datetime import datetime
@@ -167,40 +168,54 @@ def _cftc_int(row, *names):
     raise KeyError(f"缺少字段: {', '.join(names)}")
 
 
+def _clean_cftc_text(text):
+    text = html.unescape(text)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</p>|</div>|</pre>|</tr>", "\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    return text.replace("\xa0", " ")
+
+
+def _first_numeric_line(lines, start_idx):
+    for candidate in lines[start_idx:start_idx + 8]:
+        nums = re.findall(r"-?\d[\d,]*", candidate)
+        if len(nums) >= 9:
+            return [int(n.replace(",", "")) for n in nums[:9]]
+    return None
+
+
 def _parse_cftc_legacy_jpy_text(text):
-    match = re.search(
-        r"JAPANESE YEN\s*-\s*CHICAGO MERCANTILE EXCHANGE(?P<section>.*?)(?:\n\s*[A-Z][A-Z /()-]+\s*-\s*[A-Z]|\Z)",
-        text,
-        re.S,
-    )
-    if not match:
+    text = _clean_cftc_text(text)
+    lines = text.splitlines()
+
+    title_idx = None
+    for idx, line in enumerate(lines):
+        normalized = " ".join(line.upper().split())
+        if "JAPANESE YEN" in normalized and "CHICAGO MERCANTILE EXCHANGE" in normalized:
+            title_idx = idx
+            break
+
+    if title_idx is None:
         raise RuntimeError("CFTC当前报告中未找到Japanese Yen行")
 
-    section = match.group("section")
+    section = lines[title_idx:title_idx + 40]
     report_date = "N/A"
-    date_match = re.search(r"POSITIONS AS OF\s+(\d{2}/\d{2}/\d{2})", text)
+    date_match = re.search(r"POSITIONS AS OF\s+(\d{2}/\d{2}/\d{2})", "\n".join(section))
     if date_match:
         report_date = date_match.group(1)
 
-    lines = section.splitlines()
     commitments = None
     changes = None
-    for idx, line in enumerate(lines):
-        if "Commitments" in line:
-            for candidate in lines[idx + 1:idx + 6]:
-                nums = re.findall(r"-?\d[\d,]*", candidate)
-                if len(nums) >= 8:
-                    commitments = [int(n.replace(",", "")) for n in nums]
-                    break
-        if "Changes from" in line:
-            for candidate in lines[idx + 1:idx + 6]:
-                nums = re.findall(r"-?\d[\d,]*", candidate)
-                if len(nums) >= 8:
-                    changes = [int(n.replace(",", "")) for n in nums]
-                    break
+    for idx, line in enumerate(section):
+        upper = line.upper()
+        if "COMMITMENTS" in upper and commitments is None:
+            commitments = _first_numeric_line(section, idx + 1)
+        if "CHANGES FROM" in upper and changes is None:
+            changes = _first_numeric_line(section, idx + 1)
 
     if not commitments:
-        raise RuntimeError("CFTC Japanese Yen区块中未找到Commitments数字")
+        preview = " | ".join(s.strip() for s in section[:12] if s.strip())[:500]
+        raise RuntimeError(f"CFTC Japanese Yen区块中未找到Commitments数字；预览: {preview}")
 
     long_pos = commitments[0]
     short_pos = commitments[1]
@@ -217,7 +232,6 @@ def _parse_cftc_legacy_jpy_text(text):
         "is_net_short": net_position < 0,
         "source": "CFTC CME Legacy Futures Only",
     }
-
 
 def _fetch_cftc_current_legacy_jpy():
     urls = [
