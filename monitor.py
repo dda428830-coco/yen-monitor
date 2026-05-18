@@ -263,6 +263,13 @@ def build_discord_message(prices, move, cftc, usdjpy_vol, score, level, alerts):
             return "N/A"
         return f"{d[key]}"
 
+    def fred_unavailable_text(data, default_note):
+        if data and data.get("error"):
+            return f"FRED请求失败：{data['error']}"
+        if data and data.get("note"):
+            return data["note"]
+        return default_note
+
     # 主标题颜色
     color_map = {"🔴 高危": 0xFF0000, "🟡 警戒": 0xFFA500, "🟢 正常": 0x00AA00}
     color = color_map.get(level, 0x888888)
@@ -320,7 +327,7 @@ def build_discord_message(prices, move, cftc, usdjpy_vol, score, level, alerts):
     else:
         fields.append({
             "name": "📊 MOVE 债市波动率",
-            "value": move.get("note", "数据不可用（需配置FRED_API_KEY）"),
+            "value": fred_unavailable_text(move, "数据不可用（需配置FRED_API_KEY）"),
             "inline": True
         })
 
@@ -342,7 +349,7 @@ def build_discord_message(prices, move, cftc, usdjpy_vol, score, level, alerts):
     else:
         fields.append({
             "name": "📋 CFTC 日元净持仓",
-            "value": cftc.get("note", "数据不可用（需配置FRED_API_KEY）"),
+            "value": fred_unavailable_text(cftc, "数据不可用（需配置FRED_API_KEY）"),
             "inline": True
         })
 

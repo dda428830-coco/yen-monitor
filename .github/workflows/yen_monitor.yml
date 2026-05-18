@@ -30,4 +30,9 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
         run: |
+          if [ -z "$FRED_API_KEY" ]; then
+            echo "FRED_API_KEY is EMPTY"
+          else
+            echo "FRED_API_KEY is SET, length=${#FRED_API_KEY}"
+          fi
           python monitor.py
